@@ -64,12 +64,17 @@ export interface AgentAdapter {
 	resumeArgs(sessionId: string, correction: string, opts: SpawnOpts): string[] | null;
 }
 
+/** Cap on stored events per session to bound memory */
+export const MAX_EVENTS_PER_SESSION = 2000;
+
 export interface Session {
 	id: string;
 	agent: AgentId;
 	task: string;
+	cwd?: string;
 	status: "running" | "done" | "error" | "killed";
 	events: NormalizedEvent[];
+	outputChunks: string[];
 	output: string;
 	usage: UsageStats;
 	sessionId?: string;

@@ -5,8 +5,8 @@
  * streams their JSON output, and returns structured results to the parent agent.
  *
  * UI layer:
- *   - Status widget in footer showing active/completed delegates
- *   - Ctrl+D opens session list overlay (view, kill, guide)
+ *   - Status widget below editor showing active/completed delegates
+ *   - delegate_sessions tool opens session list overlay (view, kill, guide)
  *   - Session viewer overlay streams agent output in real-time
  *   - Ctrl+G guide flow: kill agent, input correction, resume
  */
@@ -17,7 +17,8 @@ import { type ExtensionAPI, getMarkdownTheme } from "@mariozechner/pi-coding-age
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { SessionManager } from "./session-manager.js";
-import type { AgentId, DelegateDetails, NormalizedEvent, Session } from "./types.js";
+import { statusIcon, formatUsage, toolCallSummary } from "./shared.js";
+import type { AgentId, DelegateDetails, Session } from "./types.js";
 import { formatStatusLine } from "./ui/status-widget.js";
 import { showSessionList } from "./ui/session-list.js";
 import { showSessionViewer } from "./ui/session-viewer.js";
@@ -25,49 +26,6 @@ import { showSessionViewer } from "./ui/session-viewer.js";
 const MAX_PARALLEL = 4;
 const COLLAPSED_LINES = 8;
 const WIDGET_ID = "pi-delegate";
-
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
-}
-
-function formatUsage(session: Session): string {
-	const u = session.usage;
-	const parts: string[] = [];
-	if (u.turns) parts.push(`${u.turns} turn${u.turns > 1 ? "s" : ""}`);
-	if (u.input) parts.push(`\u2191${formatTokens(u.input)}`);
-	if (u.output) parts.push(`\u2193${formatTokens(u.output)}`);
-	if (u.cacheRead) parts.push(`R${formatTokens(u.cacheRead)}`);
-	if (u.cacheWrite) parts.push(`W${formatTokens(u.cacheWrite)}`);
-	if (u.cost) parts.push(`$${u.cost.toFixed(4)}`);
-	if (session.model) parts.push(session.model);
-	return parts.join(" ");
-}
-
-function statusIcon(status: Session["status"]): string {
-	switch (status) {
-		case "running": return "\u23f3";
-		case "done": return "\u2713";
-		case "error": return "\u2717";
-		case "killed": return "\u25a0";
-	}
-}
-
-function toolCallSummary(ev: NormalizedEvent): string {
-	if (ev.type !== "tool_call") return "";
-	const name = ev.toolName || "?";
-	if (name === "bash" && ev.toolArgs?.command) {
-		const cmd = String(ev.toolArgs.command);
-		return `$ ${cmd.length > 60 ? cmd.slice(0, 60) + "..." : cmd}`;
-	}
-	if ((name === "read" || name === "edit" || name === "write") && (ev.toolArgs?.file_path || ev.toolArgs?.path)) {
-		return `${name} ${ev.toolArgs.file_path || ev.toolArgs.path}`;
-	}
-	const argsStr = JSON.stringify(ev.toolArgs || {});
-	return `${name} ${argsStr.length > 50 ? argsStr.slice(0, 50) + "..." : argsStr}`;
-}
 
 function truncateOutput(text: string, maxLines: number): { text: string; truncated: boolean } {
 	const lines = text.split("\n");
@@ -98,17 +56,24 @@ const DelegateParams = Type.Object({
 
 export default function (pi: ExtensionAPI) {
 	const manager = new SessionManager();
+	let lastWidgetLine = "";
 
-	// --- UI: Status widget updates ---
+	// --- UI: Status widget updates (with change detection) ---
 
 	function updateStatusWidget() {
 		const sessions = manager.listSessions();
 		if (sessions.length === 0) {
-			pi.ui.setWidget(WIDGET_ID, undefined);
+			if (lastWidgetLine !== "") {
+				lastWidgetLine = "";
+				pi.ui.setWidget(WIDGET_ID, undefined);
+			}
 			return;
 		}
 		const line = formatStatusLine(sessions, pi.ui.theme.fg.bind(pi.ui.theme));
-		pi.ui.setWidget(WIDGET_ID, [line], { placement: "belowEditor" });
+		if (line !== lastWidgetLine) {
+			lastWidgetLine = line;
+			pi.ui.setWidget(WIDGET_ID, [line], { placement: "belowEditor" });
+		}
 	}
 
 	// --- UI: Session list + viewer loop ---
@@ -125,24 +90,19 @@ export default function (pi: ExtensionAPI) {
 			if (action.type === "kill") {
 				manager.kill(action.sessionId);
 				updateStatusWidget();
-				continue; // Stay in list
+				continue;
 			}
 
 			if (action.type === "guide") {
 				await handleGuide(action.sessionId);
-				continue; // Stay in list
+				continue;
 			}
 
 			if (action.type === "view") {
 				const viewResult = await showSessionViewer(pi, manager, action.sessionId);
 
-				if (viewResult.action === "back") {
-					continue; // Back to list
-				}
-				if (viewResult.action === "background") {
-					keepGoing = false; // Close UI, agent continues
-					break;
-				}
+				if (viewResult.action === "back") continue;
+				if (viewResult.action === "background") { keepGoing = false; break; }
 				if (viewResult.action === "kill") {
 					manager.kill(action.sessionId);
 					updateStatusWidget();
@@ -160,12 +120,10 @@ export default function (pi: ExtensionAPI) {
 		const session = manager.getSession(sessionId);
 		if (!session) return;
 
-		// Kill if still running
 		if (session.status === "running") {
 			manager.kill(sessionId);
 		}
 
-		// Get correction from user
 		const correction = await pi.ui.input(
 			`Guide ${session.agent} (${sessionId}):`,
 			"Enter correction or new direction...",
@@ -173,7 +131,6 @@ export default function (pi: ExtensionAPI) {
 
 		if (!correction || correction.trim() === "") return;
 
-		// Resume with correction
 		const resumed = await manager.resume(sessionId, correction.trim(), () => {
 			updateStatusWidget();
 		});
@@ -187,26 +144,8 @@ export default function (pi: ExtensionAPI) {
 		pi.ui.notify(`Resumed as ${resumed.id}`, "info");
 	}
 
-	// --- UI: Ctrl+D keybinding via session_start hook ---
+	// --- Tool: delegate_sessions (manual UI trigger) ---
 
-	pi.on("session_start", () => {
-		// Register Ctrl+D as the session list shortcut
-		pi.ui.setFooter((tui, theme) => {
-			const sessions = manager.listSessions();
-			const running = sessions.filter((s) => s.status === "running").length;
-			if (running === 0 && sessions.length === 0) return undefined;
-
-			return {
-				render(width: number): string[] {
-					const line = formatStatusLine(sessions, theme.fg.bind(theme));
-					return line ? [line] : [];
-				},
-				invalidate() {},
-			};
-		});
-	});
-
-	// Register a keyboard handler tool that the user can invoke manually
 	pi.registerTool({
 		name: "delegate_sessions",
 		label: "Delegate Sessions",
@@ -236,7 +175,7 @@ export default function (pi: ExtensionAPI) {
 			"Uses official CLI tools in headless mode with structured JSON output.",
 			"Single mode: { agent, task }. Parallel mode: { tasks: [{ agent, task }, ...] }.",
 			"Each agent runs as an isolated subprocess. Results include full output and usage stats.",
-			"User can press Ctrl+D or invoke delegate_sessions to view/kill/guide running agents.",
+			"User can invoke delegate_sessions to view/kill/guide running agents.",
 		].join(" "),
 		parameters: DelegateParams,
 
@@ -265,6 +204,10 @@ export default function (pi: ExtensionAPI) {
 				};
 			};
 
+			const sessionUpdateHandler = (_session: Session) => {
+				updateStatusWidget();
+			};
+
 			if (hasSingle) {
 				const agent = params.agent as AgentId;
 				const session = await manager.spawn(
@@ -276,13 +219,8 @@ export default function (pi: ExtensionAPI) {
 						signal,
 					},
 					onUpdate
-						? (_session) => {
-								updateStatusWidget();
-								onUpdate(makeResult([_session], "single"));
-							}
-						: (_session) => {
-								updateStatusWidget();
-							},
+						? (s) => { updateStatusWidget(); onUpdate(makeResult([s], "single")); }
+						: sessionUpdateHandler,
 				);
 
 				const result = makeResult([session], "single");
@@ -300,8 +238,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const allSessions: Session[] = [];
-			const promises = tasks.map(async (t) => {
+			const sessionsByIndex = new Map<number, Session>();
+			const promises = tasks.map(async (t, idx) => {
 				const session = await manager.spawn(
 					t.agent as AgentId,
 					{
@@ -312,16 +250,16 @@ export default function (pi: ExtensionAPI) {
 					},
 					onUpdate
 						? (s) => {
-								if (!allSessions.includes(s)) allSessions.push(s);
+								sessionsByIndex.set(idx, s);
 								updateStatusWidget();
-								onUpdate(makeResult(allSessions, "parallel"));
+								onUpdate(makeResult(Array.from(sessionsByIndex.values()), "parallel"));
 							}
 						: (s) => {
-								if (!allSessions.includes(s)) allSessions.push(s);
+								sessionsByIndex.set(idx, s);
 								updateStatusWidget();
 							},
 				);
-				if (!allSessions.includes(session)) allSessions.push(session);
+				sessionsByIndex.set(idx, session);
 				return session;
 			});
 

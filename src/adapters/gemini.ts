@@ -6,6 +6,7 @@
  */
 
 import type { AgentAdapter, NormalizedEvent, SpawnOpts } from "../types.js";
+import { safeParseLine } from "../shared.js";
 
 export const gemini: AgentAdapter = {
 	bin: "gemini",
@@ -17,22 +18,13 @@ export const gemini: AgentAdapter = {
 	},
 
 	parseLine(line: string): NormalizedEvent[] {
-		if (!line.trim()) return [];
-		let event: any;
-		try {
-			event = JSON.parse(line);
-		} catch {
-			return [];
-		}
+		const event = safeParseLine(line);
+		if (!event) return [];
 
 		const events: NormalizedEvent[] = [];
 
 		if (event.type === "message" && event.role === "assistant") {
-			if (event.delta) {
-				events.push({ type: "text_delta", text: event.content });
-			} else {
-				events.push({ type: "text_delta", text: event.content });
-			}
+			events.push({ type: "text_delta", text: event.content });
 		}
 
 		if (event.type === "tool_use") {

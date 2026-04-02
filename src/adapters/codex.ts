@@ -6,6 +6,7 @@
  */
 
 import type { AgentAdapter, NormalizedEvent, SpawnOpts } from "../types.js";
+import { safeParseLine } from "../shared.js";
 
 export const codex: AgentAdapter = {
 	bin: "codex",
@@ -17,13 +18,8 @@ export const codex: AgentAdapter = {
 	},
 
 	parseLine(line: string): NormalizedEvent[] {
-		if (!line.trim()) return [];
-		let event: any;
-		try {
-			event = JSON.parse(line);
-		} catch {
-			return [];
-		}
+		const event = safeParseLine(line);
+		if (!event) return [];
 
 		const events: NormalizedEvent[] = [];
 

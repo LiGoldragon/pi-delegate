@@ -1,7 +1,7 @@
 /**
- * Session list overlay — Ctrl+D opens a SelectList of all delegate sessions
+ * Session list overlay — pick a delegate session to view, kill, or guide
  *
- * Picking a session opens the session viewer. Actions available from the list:
+ * Key bindings:
  *   Enter  — view session output
  *   Ctrl+K — kill selected session
  *   Ctrl+G — guide (kill + resume with correction)
@@ -12,16 +12,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Container, Text } from "@mariozechner/pi-tui";
 import { matchesKey, Key } from "@mariozechner/pi-tui";
 import type { SessionManager } from "../session-manager.js";
-import type { Session } from "../types.js";
-
-function icon(status: Session["status"]): string {
-	switch (status) {
-		case "running": return "\u23f3";
-		case "done": return "\u2713";
-		case "error": return "\u2717";
-		case "killed": return "\u25a0";
-	}
-}
+import { statusIcon } from "../shared.js";
 
 interface SessionListAction {
 	type: "view" | "kill" | "guide";
@@ -51,7 +42,6 @@ export async function showSessionList(
 				return;
 			}
 
-			// Header
 			container.addChild(new Text(
 				theme.fg("toolTitle", theme.bold(" Delegate Sessions ")),
 				1, 0,
@@ -67,7 +57,7 @@ export async function showSessionList(
 				const selected = i === selectedIndex;
 				const prefix = selected ? theme.fg("accent", "\u25b6 ") : "  ";
 				const statusColor = s.status === "done" ? "success" : s.status === "running" ? "warning" : "error";
-				const statusText = theme.fg(statusColor, icon(s.status));
+				const statusText = theme.fg(statusColor, statusIcon(s.status));
 
 				const taskPreview = s.task.length > 50 ? s.task.slice(0, 50) + "..." : s.task;
 				const line = `${prefix}${statusText} ${theme.fg("accent", s.agent)} ${theme.fg("dim", taskPreview)}`;

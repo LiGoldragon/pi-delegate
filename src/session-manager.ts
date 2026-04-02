@@ -9,10 +9,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import {
 	type AgentAdapter,
 	type AgentId,
-	type DelegateDetails,
 	type NormalizedEvent,
 	type Session,
 	type SpawnOpts,
+	MAX_EVENTS_PER_SESSION,
 	emptyUsage,
 } from "./types.js";
 import { claude } from "./adapters/claude.js";
@@ -33,13 +33,21 @@ export type OnSessionUpdate = (session: Session, allSessions: Session[]) => void
 export class SessionManager {
 	private sessions = new Map<string, Session>();
 	private processes = new Map<string, ChildProcess>();
+	private cachedList: Session[] | null = null;
 
 	getAdapter(agent: AgentId): AgentAdapter {
 		return adapters[agent];
 	}
 
 	listSessions(): Session[] {
-		return Array.from(this.sessions.values());
+		if (!this.cachedList) {
+			this.cachedList = Array.from(this.sessions.values());
+		}
+		return this.cachedList;
+	}
+
+	private invalidateCache(): void {
+		this.cachedList = null;
 	}
 
 	getSession(id: string): Session | undefined {
@@ -59,81 +67,18 @@ export class SessionManager {
 			id,
 			agent,
 			task: opts.task,
+			cwd: opts.cwd,
 			status: "running",
 			events: [],
+			outputChunks: [],
 			output: "",
 			usage: emptyUsage(),
 			model: opts.model,
 		};
 		this.sessions.set(id, session);
+		this.invalidateCache();
 
-		const exitCode = await new Promise<number>((resolve) => {
-			const proc = spawn(adapter.bin, args, {
-				cwd: opts.cwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env },
-			});
-
-			session.pid = proc.pid;
-			this.processes.set(id, proc);
-
-			let buffer = "";
-
-			const processLine = (line: string) => {
-				const normalized = adapter.parseLine(line);
-				for (const ev of normalized) {
-					session.events.push(ev);
-					this.applyEvent(session, ev);
-				}
-				if (normalized.length > 0 && onUpdate) {
-					onUpdate(session, this.listSessions());
-				}
-			};
-
-			proc.stdout!.on("data", (data: Buffer) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr!.on("data", (data: Buffer) => {
-				// Stderr goes nowhere useful for now — could log
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				this.processes.delete(id);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", (err) => {
-				session.status = "error";
-				session.events.push({ type: "error", error: err.message });
-				this.processes.delete(id);
-				resolve(1);
-			});
-
-			if (opts.signal) {
-				const kill = () => {
-					session.status = "killed";
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (opts.signal.aborted) kill();
-				else opts.signal.addEventListener("abort", kill, { once: true });
-			}
-		});
-
-		session.exitCode = exitCode;
-		if (session.status === "running") {
-			session.status = exitCode === 0 ? "done" : "error";
-		}
-
-		if (onUpdate) onUpdate(session, this.listSessions());
+		await this.runProcess(adapter, args, session, opts.cwd, opts.signal, onUpdate);
 		return session;
 	}
 
@@ -162,40 +107,58 @@ export class SessionManager {
 		const resumeArgs = adapter.resumeArgs(
 			original.sessionId || id,
 			correction,
-			{ task: correction, model: original.model, cwd: undefined },
+			{ task: correction, model: original.model, cwd: original.cwd },
 		);
 
 		if (!resumeArgs) return null;
 
-		// Spawn a new session that continues the work
 		const newId = makeSessionId(original.agent);
 		const session: Session = {
 			id: newId,
 			agent: original.agent,
 			task: `[resume] ${correction}`,
+			cwd: original.cwd,
 			status: "running",
 			events: [],
+			outputChunks: [],
 			output: "",
 			usage: emptyUsage(),
 			model: original.model,
 		};
 		this.sessions.set(newId, session);
+		this.invalidateCache();
 
+		await this.runProcess(adapter, resumeArgs, session, original.cwd, undefined, onUpdate);
+		return session;
+	}
+
+	/** Shared subprocess lifecycle: spawn, stream, parse, track */
+	private async runProcess(
+		adapter: AgentAdapter,
+		args: string[],
+		session: Session,
+		cwd: string | undefined,
+		signal: AbortSignal | undefined,
+		onUpdate: OnSessionUpdate | undefined,
+	): Promise<void> {
 		const exitCode = await new Promise<number>((resolve) => {
-			const proc = spawn(adapter.bin, resumeArgs, {
+			const proc = spawn(adapter.bin, args, {
+				cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env },
 			});
 
 			session.pid = proc.pid;
-			this.processes.set(newId, proc);
+			this.processes.set(session.id, proc);
 
 			let buffer = "";
+
 			const processLine = (line: string) => {
 				const normalized = adapter.parseLine(line);
 				for (const ev of normalized) {
-					session.events.push(ev);
+					if (session.events.length < MAX_EVENTS_PER_SESSION) {
+						session.events.push(ev);
+					}
 					this.applyEvent(session, ev);
 				}
 				if (normalized.length > 0 && onUpdate) {
@@ -214,32 +177,50 @@ export class SessionManager {
 
 			proc.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
-				this.processes.delete(newId);
+				this.processes.delete(session.id);
 				resolve(code ?? 0);
 			});
 
-			proc.on("error", () => {
-				this.processes.delete(newId);
+			proc.on("error", (err) => {
+				session.status = "error";
+				session.events.push({ type: "error", error: err.message });
+				this.processes.delete(session.id);
 				resolve(1);
 			});
+
+			if (signal) {
+				const kill = () => {
+					session.status = "killed";
+					proc.kill("SIGTERM");
+					setTimeout(() => {
+						if (!proc.killed) proc.kill("SIGKILL");
+					}, 5000);
+				};
+				if (signal.aborted) kill();
+				else signal.addEventListener("abort", kill, { once: true });
+			}
 		});
 
 		session.exitCode = exitCode;
 		if (session.status === "running") {
 			session.status = exitCode === 0 ? "done" : "error";
 		}
+		// Finalize output from chunks
+		session.output = session.outputChunks.join("");
 
 		if (onUpdate) onUpdate(session, this.listSessions());
-		return session;
 	}
 
 	private applyEvent(session: Session, ev: NormalizedEvent): void {
 		if (ev.type === "text_delta" && ev.text) {
-			session.output += ev.text;
+			session.outputChunks.push(ev.text);
 		}
 		if (ev.type === "done") {
 			if (ev.sessionId) session.sessionId = ev.sessionId;
-			if (ev.text) session.output = ev.text;
+			// done.text is the authoritative final output if present
+			if (ev.text) {
+				session.outputChunks = [ev.text];
+			}
 			if (ev.usage) session.usage = ev.usage;
 		}
 		if (ev.type === "usage" && ev.usage) {

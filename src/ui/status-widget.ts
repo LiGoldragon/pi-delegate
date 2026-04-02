@@ -1,19 +1,9 @@
 /**
  * Footer status widget — persistent bar showing running/completed delegates
- *
- * Rendered via ctx.ui.setWidget(), updates on every session state change.
  */
 
 import type { Session } from "../types.js";
-
-function icon(status: Session["status"]): string {
-	switch (status) {
-		case "running": return "\u23f3";
-		case "done": return "\u2713";
-		case "error": return "\u2717";
-		case "killed": return "\u25a0";
-	}
-}
+import { statusIcon } from "../shared.js";
 
 export function formatStatusLine(
 	sessions: Session[],
@@ -27,11 +17,11 @@ export function formatStatusLine(
 	const parts: string[] = [];
 
 	for (const s of running) {
-		parts.push(themeFg("warning", `${icon(s.status)} ${s.agent}`));
+		parts.push(themeFg("warning", `${statusIcon(s.status)} ${s.agent}`));
 	}
 	for (const s of done) {
 		const color = s.status === "done" ? "success" : "error";
-		parts.push(themeFg(color, `${icon(s.status)} ${s.agent}`));
+		parts.push(themeFg(color, `${statusIcon(s.status)} ${s.agent}`));
 	}
 
 	const summary = parts.join("  ");
