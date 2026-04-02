@@ -3,6 +3,12 @@
  *
  * Registers a `delegate` tool that spawns agent subprocesses in headless mode,
  * streams their JSON output, and returns structured results to the parent agent.
+ *
+ * UI layer:
+ *   - Status widget in footer showing active/completed delegates
+ *   - Ctrl+D opens session list overlay (view, kill, guide)
+ *   - Session viewer overlay streams agent output in real-time
+ *   - Ctrl+G guide flow: kill agent, input correction, resume
  */
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
@@ -12,9 +18,13 @@ import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { SessionManager } from "./session-manager.js";
 import type { AgentId, DelegateDetails, NormalizedEvent, Session } from "./types.js";
+import { formatStatusLine } from "./ui/status-widget.js";
+import { showSessionList } from "./ui/session-list.js";
+import { showSessionViewer } from "./ui/session-viewer.js";
 
 const MAX_PARALLEL = 4;
 const COLLAPSED_LINES = 8;
+const WIDGET_ID = "pi-delegate";
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -89,6 +99,135 @@ const DelegateParams = Type.Object({
 export default function (pi: ExtensionAPI) {
 	const manager = new SessionManager();
 
+	// --- UI: Status widget updates ---
+
+	function updateStatusWidget() {
+		const sessions = manager.listSessions();
+		if (sessions.length === 0) {
+			pi.ui.setWidget(WIDGET_ID, undefined);
+			return;
+		}
+		const line = formatStatusLine(sessions, pi.ui.theme.fg.bind(pi.ui.theme));
+		pi.ui.setWidget(WIDGET_ID, [line], { placement: "belowEditor" });
+	}
+
+	// --- UI: Session list + viewer loop ---
+
+	async function openSessionUI() {
+		let keepGoing = true;
+		while (keepGoing) {
+			const action = await showSessionList(pi, manager);
+			if (!action) {
+				keepGoing = false;
+				break;
+			}
+
+			if (action.type === "kill") {
+				manager.kill(action.sessionId);
+				updateStatusWidget();
+				continue; // Stay in list
+			}
+
+			if (action.type === "guide") {
+				await handleGuide(action.sessionId);
+				continue; // Stay in list
+			}
+
+			if (action.type === "view") {
+				const viewResult = await showSessionViewer(pi, manager, action.sessionId);
+
+				if (viewResult.action === "back") {
+					continue; // Back to list
+				}
+				if (viewResult.action === "background") {
+					keepGoing = false; // Close UI, agent continues
+					break;
+				}
+				if (viewResult.action === "kill") {
+					manager.kill(action.sessionId);
+					updateStatusWidget();
+					continue;
+				}
+				if (viewResult.action === "guide") {
+					await handleGuide(action.sessionId);
+					continue;
+				}
+			}
+		}
+	}
+
+	async function handleGuide(sessionId: string) {
+		const session = manager.getSession(sessionId);
+		if (!session) return;
+
+		// Kill if still running
+		if (session.status === "running") {
+			manager.kill(sessionId);
+		}
+
+		// Get correction from user
+		const correction = await pi.ui.input(
+			`Guide ${session.agent} (${sessionId}):`,
+			"Enter correction or new direction...",
+		);
+
+		if (!correction || correction.trim() === "") return;
+
+		// Resume with correction
+		const resumed = await manager.resume(sessionId, correction.trim(), () => {
+			updateStatusWidget();
+		});
+
+		if (!resumed) {
+			pi.ui.notify(`Could not resume ${session.agent} session`, "error");
+			return;
+		}
+
+		updateStatusWidget();
+		pi.ui.notify(`Resumed as ${resumed.id}`, "info");
+	}
+
+	// --- UI: Ctrl+D keybinding via session_start hook ---
+
+	pi.on("session_start", () => {
+		// Register Ctrl+D as the session list shortcut
+		pi.ui.setFooter((tui, theme) => {
+			const sessions = manager.listSessions();
+			const running = sessions.filter((s) => s.status === "running").length;
+			if (running === 0 && sessions.length === 0) return undefined;
+
+			return {
+				render(width: number): string[] {
+					const line = formatStatusLine(sessions, theme.fg.bind(theme));
+					return line ? [line] : [];
+				},
+				invalidate() {},
+			};
+		});
+	});
+
+	// Register a keyboard handler tool that the user can invoke manually
+	pi.registerTool({
+		name: "delegate_sessions",
+		label: "Delegate Sessions",
+		description: "Open the delegate session manager UI. View, kill, or guide running delegate agents.",
+		parameters: Type.Object({}),
+
+		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+			await openSessionUI();
+			const sessions = manager.listSessions();
+			const summary = sessions.map((s) =>
+				`${statusIcon(s.status)} ${s.agent}: ${s.task.slice(0, 60)}`
+			).join("\n");
+			return {
+				content: [{ type: "text", text: summary || "No sessions" }],
+				details: { mode: "single", sessions } as DelegateDetails,
+			};
+		},
+	});
+
+	// --- Tool: delegate ---
+
 	pi.registerTool({
 		name: "delegate",
 		label: "Delegate",
@@ -97,6 +236,7 @@ export default function (pi: ExtensionAPI) {
 			"Uses official CLI tools in headless mode with structured JSON output.",
 			"Single mode: { agent, task }. Parallel mode: { tasks: [{ agent, task }, ...] }.",
 			"Each agent runs as an isolated subprocess. Results include full output and usage stats.",
+			"User can press Ctrl+D or invoke delegate_sessions to view/kill/guide running agents.",
 		].join(" "),
 		parameters: DelegateParams,
 
@@ -136,14 +276,18 @@ export default function (pi: ExtensionAPI) {
 						signal,
 					},
 					onUpdate
-						? (_session, all) => {
+						? (_session) => {
+								updateStatusWidget();
 								onUpdate(makeResult([_session], "single"));
 							}
-						: undefined,
+						: (_session) => {
+								updateStatusWidget();
+							},
 				);
 
 				const result = makeResult([session], "single");
 				if (session.status === "error") result.isError = true;
+				updateStatusWidget();
 				return result;
 			}
 
@@ -167,12 +311,15 @@ export default function (pi: ExtensionAPI) {
 						signal,
 					},
 					onUpdate
-						? (s, _all) => {
-								const idx = allSessions.indexOf(s);
-								if (idx === -1) allSessions.push(s);
+						? (s) => {
+								if (!allSessions.includes(s)) allSessions.push(s);
+								updateStatusWidget();
 								onUpdate(makeResult(allSessions, "parallel"));
 							}
-						: undefined,
+						: (s) => {
+								if (!allSessions.includes(s)) allSessions.push(s);
+								updateStatusWidget();
+							},
 				);
 				if (!allSessions.includes(session)) allSessions.push(session);
 				return session;
@@ -181,6 +328,7 @@ export default function (pi: ExtensionAPI) {
 			const sessions = await Promise.all(promises);
 			const result = makeResult(sessions, "parallel");
 			if (sessions.some((s) => s.status === "error")) result.isError = true;
+			updateStatusWidget();
 			return result;
 		},
 
@@ -221,7 +369,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (details.sessions.length === 1) {
 				const s = details.sessions[0];
-				const icon = theme.fg(
+				const iconStr = theme.fg(
 					s.status === "done" ? "success" : s.status === "running" ? "warning" : "error",
 					statusIcon(s.status),
 				);
@@ -229,12 +377,11 @@ export default function (pi: ExtensionAPI) {
 				if (expanded) {
 					const container = new Container();
 					container.addChild(new Text(
-						`${icon} ${theme.fg("toolTitle", theme.bold(s.agent))} ${theme.fg("dim", formatUsage(s))}`,
+						`${iconStr} ${theme.fg("toolTitle", theme.bold(s.agent))} ${theme.fg("dim", formatUsage(s))}`,
 						0, 0,
 					));
 					container.addChild(new Spacer(1));
 
-					// Tool calls
 					const toolCalls = s.events.filter((e) => e.type === "tool_call");
 					if (toolCalls.length > 0) {
 						container.addChild(new Text(theme.fg("muted", "\u2500\u2500\u2500 Tools \u2500\u2500\u2500"), 0, 0));
@@ -247,7 +394,6 @@ export default function (pi: ExtensionAPI) {
 						container.addChild(new Spacer(1));
 					}
 
-					// Output
 					if (s.output.trim()) {
 						container.addChild(new Text(theme.fg("muted", "\u2500\u2500\u2500 Output \u2500\u2500\u2500"), 0, 0));
 						container.addChild(new Markdown(s.output.trim(), 0, 0, mdTheme));
@@ -258,9 +404,8 @@ export default function (pi: ExtensionAPI) {
 					return container;
 				}
 
-				// Collapsed
 				const { text: truncated, truncated: wasTruncated } = truncateOutput(s.output, COLLAPSED_LINES);
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold(s.agent))} ${theme.fg("dim", formatUsage(s))}`;
+				let text = `${iconStr} ${theme.fg("toolTitle", theme.bold(s.agent))} ${theme.fg("dim", formatUsage(s))}`;
 				if (truncated.trim()) {
 					text += `\n${theme.fg("toolOutput", truncated)}`;
 				} else {
@@ -274,7 +419,7 @@ export default function (pi: ExtensionAPI) {
 			const running = details.sessions.filter((s) => s.status === "running").length;
 			const done = details.sessions.filter((s) => s.status !== "running").length;
 			const allDone = running === 0;
-			const icon = allDone
+			const iconStr = allDone
 				? theme.fg("success", "\u2713")
 				: theme.fg("warning", "\u23f3");
 			const status = allDone
@@ -284,7 +429,7 @@ export default function (pi: ExtensionAPI) {
 			if (expanded && allDone) {
 				const container = new Container();
 				container.addChild(new Text(
-					`${icon} ${theme.fg("toolTitle", theme.bold("delegate "))}${theme.fg("accent", status)}`,
+					`${iconStr} ${theme.fg("toolTitle", theme.bold("delegate "))}${theme.fg("accent", status)}`,
 					0, 0,
 				));
 
@@ -307,8 +452,7 @@ export default function (pi: ExtensionAPI) {
 				return container;
 			}
 
-			// Collapsed parallel
-			let text = `${icon} ${theme.fg("toolTitle", theme.bold("delegate "))}${theme.fg("accent", status)}`;
+			let text = `${iconStr} ${theme.fg("toolTitle", theme.bold("delegate "))}${theme.fg("accent", status)}`;
 			for (const s of details.sessions) {
 				const sIcon = theme.fg(
 					s.status === "done" ? "success" : s.status === "running" ? "warning" : "error",
