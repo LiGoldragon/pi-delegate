@@ -61,6 +61,7 @@ export default function (pi: ExtensionAPI) {
 	// --- UI: Status widget updates (with change detection) ---
 
 	function updateStatusWidget() {
+		if (!pi.ui?.theme) return; // No TUI in headless mode
 		const sessions = manager.listSessions();
 		if (sessions.length === 0) {
 			if (lastWidgetLine !== "") {
